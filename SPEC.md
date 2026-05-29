@@ -19,6 +19,13 @@ Symphony is a long-running automation service that continuously reads work from 
 (Linear in this specification version), creates an isolated workspace for each issue, and runs a
 coding agent session for that issue inside the workspace.
 
+Architecture note: the issue tracker and the coding-agent harness are the two external systems
+Symphony integrates, and both are reached exclusively through driven ports (Section 3.4). Linear and
+Codex are therefore the *bundled adapters* in this specification version, not hard dependencies of
+the orchestration core. Replacing the tracker (for example Linear with Jira or GitHub) or the agent
+harness (for example Codex with another runner) is an adapter-only change; the normative rules that
+guarantee this are in Sections 3.4 and 3.5.
+
 The service solves four operational problems:
 
 - It turns issue execution into a repeatable daemon workflow instead of manual scripts.
@@ -80,7 +87,7 @@ Important boundary:
    - Applies defaults and environment variable indirection.
    - Performs validation used by the orchestrator before dispatch.
 
-3. `Issue Tracker Client`
+3. `Issue Tracker Client` (Tracker-port adapter; see Sections 3.4 and 11.1)
    - Fetches candidate issues in active states.
    - Fetches current states for specific issue IDs (reconciliation).
    - Fetches terminal-state issues during startup cleanup.
@@ -98,11 +105,11 @@ Important boundary:
    - Runs workspace lifecycle hooks.
    - Cleans workspaces for terminal issues.
 
-6. `Agent Runner`
+6. `Agent Runner` (Agent-Harness-port adapter; see Sections 3.4 and 10.8)
    - Creates workspace.
    - Builds prompt from issue + workflow template.
    - Launches the coding agent app-server client.
-   - Streams agent updates back to the orchestrator.
+   - Streams normalized agent events back to the orchestrator.
 
 7. `Status Surface` (OPTIONAL)
    - Presents human-readable runtime status (for example terminal output, dashboard, or other
@@ -113,7 +120,10 @@ Important boundary:
 
 ### 3.2 Abstraction Levels
 
-Symphony is easiest to port when kept in these layers:
+Symphony is easiest to port when kept in these layers. Layers 3–4 split along the two driven ports
+defined in Section 3.4: the Coordination Layer is the orchestration core and depends only on ports
+and the domain model, while the Integration Layer (and the harness portion of the Execution Layer)
+are adapters that sit behind those ports. The core MUST NOT depend on any concrete adapter.
 
 1. `Policy Layer` (repo-defined)
    - `WORKFLOW.md` prompt body.
@@ -126,22 +136,118 @@ Symphony is easiest to port when kept in these layers:
 3. `Coordination Layer` (orchestrator)
    - Polling loop, issue eligibility, concurrency, retries, reconciliation.
 
-4. `Execution Layer` (workspace + agent subprocess)
-   - Filesystem lifecycle, workspace preparation, coding-agent protocol.
+4. `Execution Layer` (workspace + Agent Harness adapter)
+   - Filesystem lifecycle and workspace preparation (core-owned).
+   - Agent Harness adapter: the coding-agent protocol behind the Agent Harness port (Section 10.8).
+     Codex is the bundled Agent-Harness-port adapter; the protocol details in Section 10 are
+     adapter-internal.
 
-5. `Integration Layer` (Linear adapter)
-   - API calls and normalization for tracker data.
+5. `Integration Layer` (Tracker adapters)
+   - API calls and normalization for tracker data behind the Tracker port (Section 11.1).
+   - Linear is the bundled Tracker-port adapter.
 
 6. `Observability Layer` (logs + OPTIONAL status surface)
    - Operator visibility into orchestrator and agent behavior.
 
 ### 3.3 External Dependencies
 
-- Issue tracker API (Linear for `tracker.kind: linear` in this specification version).
+- Issue tracker API (Linear for `tracker.kind: linear` in this specification version) — reached only
+  through the Tracker-port adapter; an adapter concern, not a core dependency.
 - Local filesystem for workspaces and logs.
 - OPTIONAL workspace population tooling (for example Git CLI, if used).
-- Coding-agent executable that supports the targeted Codex app-server mode.
-- Host environment authentication for the issue tracker and coding agent.
+- Coding-agent executable that supports the targeted Codex app-server mode (for
+  `harness.kind: codex`) — reached only through the Agent-Harness-port adapter; an adapter concern,
+  not a core dependency.
+- Host environment authentication for the issue tracker and coding agent (consumed by the
+  respective adapters).
+
+### 3.4 Ports and Adapters (Hexagonal Architecture)
+
+Symphony's orchestration core is structured as a hexagonal (ports-and-adapters) architecture so that
+the tracker and the agent harness can be swapped from iteration 1 without touching orchestration
+logic. This section is normative.
+
+Definitions:
+
+- `Domain` — the entities and normalization rules in Section 4. Pure data; no I/O.
+- `Core` (orchestration core) — the Coordination Layer (Section 3.2, layer 3): polling, eligibility,
+  concurrency, dispatch, retries, reconciliation, token/runtime accounting, and observability state.
+- `Driven Port` — an abstract, technology-neutral interface the core calls outward through. Symphony
+  defines exactly two driven ports.
+- `Adapter` — a concrete implementation of a port for a specific external system (for example a
+  Linear Tracker adapter, a Codex Agent Harness adapter).
+
+The two driven ports:
+
+1. `Tracker` port
+   - The three read operations in Section 11.1 (`fetch_candidate_issues`,
+     `fetch_issues_by_states`, `fetch_issue_states_by_ids`), returning the normalized issue model in
+     Section 4.1.1 per the normalization rules in Section 11.3.
+   - Linear (Section 11.2) is the bundled adapter.
+
+2. `Agent Harness` port
+   - The normalized session lifecycle `start_session` → `run_turn(prompt, on_event)` →
+     `stop_session`, emitting normalized events and normalized usage/rate-limit data, defined in
+     Section 10.8.
+   - Codex (Sections 10.1–10.7) is the bundled adapter.
+
+Dependency rule (normative):
+
+- Dependencies MUST point inward: Domain ← Core ← Ports ← Adapters.
+- The core MUST depend only on the two driven ports and the domain model. The core MUST NOT depend
+  on, import, or reference any concrete adapter, adapter-specific protocol, adapter-specific
+  identifier, or adapter-specific configuration namespace.
+- The core MUST NOT name a concrete tracker or harness (for example "Linear", "Codex", "GraphQL",
+  "app-server", `thread_id`, `turn_id`) in its data structures, control flow, events, or logs;
+  it operates only on the normalized port contracts.
+- Adapters MUST depend on the ports (and the domain model); ports MUST NOT depend on adapters.
+- Adapter selection happens at the edge via dependency injection: the Tracker adapter is chosen from
+  `tracker.kind` (Section 5.3.1) and the Agent Harness adapter from `harness.kind` (Section 5.3.7).
+  The core receives already-selected port instances and never performs adapter selection itself.
+
+Adapter-swap guarantee (normative):
+
+- Adding a new tracker or a new agent harness MUST be achievable by adding a new adapter alone that
+  satisfies its port (Section 3.5), with NO change to the orchestration core, the domain model, or
+  any other adapter.
+- Conformance to this guarantee is verified by Section 17 (adapter-swap behaviors in Sections 17.4,
+  17.5, and 17.9) and Section 18 (Section 18.1 checklist).
+
+### 3.5 Adapter Authoring Guide
+
+This guide is normative and defines the minimum contract a new adapter MUST satisfy. It exists so an
+author can add a tracker or harness without reading orchestration internals.
+
+A new `Tracker` adapter MUST:
+
+- Implement the three read operations in Section 11.1.
+- Return issues normalized to the domain model in Section 4.1.1, following the normalization rules
+  in Section 11.3 (labels lowercased, blockers derived, priority integer-or-null, timestamps
+  parsed).
+- Map its own auth/endpoint/scoping configuration from its own adapter configuration namespace; it
+  MUST NOT require the core to learn tracker-specific fields.
+- Keep all tracker-native transport (for example GraphQL documents, REST routes, pagination cursors)
+  inside the adapter. Any client-side tracker tooling exposed to the agent (for example
+  `linear_graphql`, Section 10.5) is part of the adapter/agent toolchain, never orchestration logic
+  (Section 11.5).
+- Surface failures using the error categories in Section 11.4 (or an equivalent normalized set).
+
+A new `Agent Harness` adapter MUST:
+
+- Implement the normalized session lifecycle in Section 10.8: `start_session` (in the per-issue
+  workspace), `run_turn(prompt, on_event)`, and `stop_session`.
+- Emit only the normalized events and normalized usage/rate-limit data defined in Section 10.8,
+  mapping any harness-native protocol vocabulary, identifiers, and token payloads onto that
+  normalized shape inside the adapter.
+- Surface an opaque `session_id` (Section 4.2) and keep harness-native identifiers (for example
+  thread/turn ids, subprocess pids) inside the adapter.
+- Source the normalized timeouts the core requires (notably the stall timeout, Section 8.5) from its
+  own adapter configuration namespace, and enforce any harness-internal timeouts itself.
+- Honor the safety invariants in Section 9.5 (run only in the per-issue workspace path).
+
+Neither adapter type may require new orchestration-core code. If an adapter appears to need a core
+change, that is a defect in the port boundary and MUST be resolved by widening the normalized port
+contract (Sections 10.8 / 11.1), not by special-casing the adapter in the core.
 
 ## 4. Core Domain Model
 
@@ -224,25 +330,31 @@ Fields (logical):
 
 #### 4.1.6 Live Session (Agent Session Metadata)
 
-State tracked while a coding-agent subprocess is running.
+Harness-agnostic state the core tracks while an Agent Harness session is running. This entity is
+part of the orchestration core and MUST NOT contain harness-native identifiers or token field names.
+All values are populated from the normalized Agent Harness port events (Section 10.8); the bundled
+Codex adapter maps its native shape onto these fields.
 
 Fields:
 
-- `session_id` (string, `<thread_id>-<turn_id>`)
-- `thread_id` (string)
-- `turn_id` (string)
-- `codex_app_server_pid` (string or null)
-- `last_codex_event` (string/enum or null)
-- `last_codex_timestamp` (timestamp or null)
-- `last_codex_message` (summarized payload)
-- `codex_input_tokens` (integer)
-- `codex_output_tokens` (integer)
-- `codex_total_tokens` (integer)
+- `session_id` (string, opaque)
+  - Opaque harness-provided session identifier (Section 4.2). The core does not parse it.
+- `last_event` (string/enum or null)
+  - Latest normalized event type (Section 10.8), not a harness-native event name.
+- `last_event_timestamp` (timestamp or null)
+- `last_message` (summarized payload)
+- `input_tokens` (integer)
+- `output_tokens` (integer)
+- `total_tokens` (integer)
 - `last_reported_input_tokens` (integer)
 - `last_reported_output_tokens` (integer)
 - `last_reported_total_tokens` (integer)
 - `turn_count` (integer)
-  - Number of coding-agent turns started within the current worker lifetime.
+  - Number of agent turns started within the current worker lifetime.
+
+Harness-native session details — for the Codex adapter, `thread_id`, `turn_id`, the
+`codex_app_server_pid`, and Codex-native token payloads — live inside the harness adapter and are
+mapped onto the generic fields above. They MUST NOT appear in core state, core events, or core logs.
 
 #### 4.1.7 Retry Entry
 
@@ -269,8 +381,8 @@ Fields:
 - `claimed` (set of issue IDs reserved/running/retrying)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
-- `codex_totals` (aggregate tokens + runtime seconds)
-- `codex_rate_limits` (latest rate-limit snapshot from agent events)
+- `usage_totals` (aggregate normalized tokens + runtime seconds)
+- `rate_limits` (latest normalized rate-limit snapshot from agent events)
 
 ### 4.2 Stable Identifiers and Normalization Rules
 
@@ -284,7 +396,10 @@ Fields:
 - `Normalized Issue State`
   - Compare states after `lowercase`.
 - `Session ID`
-  - Compose from coding-agent `thread_id` and `turn_id` as `<thread_id>-<turn_id>`.
+  - An opaque, harness-provided identifier surfaced by the Agent Harness adapter (Section 10.8). The
+    core treats it as an opaque string and MUST NOT assume any internal structure.
+  - The bundled Codex adapter composes it from its native `thread_id` and `turn_id` as
+    `<thread_id>-<turn_id>`; that composition is an adapter detail.
 
 ## 5. Workflow Specification (Repository Contract)
 
@@ -327,14 +442,23 @@ Returned workflow object:
 
 Top-level keys:
 
-- `tracker`
+- `tracker` (Tracker-port adapter selection + config; `tracker.kind` selects the adapter)
 - `polling`
 - `workspace`
 - `hooks`
-- `agent`
-- `codex`
+- `agent` (core orchestration limits; not harness-specific)
+- `harness` (Agent-Harness-port adapter selection; `harness.kind` selects the adapter)
+- `codex` (Codex Agent Harness adapter namespace; active when `harness.kind == "codex"`)
 
 Unknown keys SHOULD be ignored for forward compatibility.
+
+Adapter-namespace rule:
+
+- `tracker.kind` and `harness.kind` are the only adapter-selection keys the core reads. All other
+  tracker-specific or harness-specific fields belong to the selected adapter's own configuration
+  namespace (for example the Linear fields under `tracker`, and the Codex fields under `codex`). A
+  new tracker or harness adapter MAY introduce its own top-level namespace without changing the core
+  schema.
 
 Note:
 
@@ -426,6 +550,13 @@ Fields:
 
 #### 5.3.6 `codex` (object)
 
+The `codex` object is the configuration namespace of the bundled Codex Agent Harness adapter. It is
+read only when `harness.kind == "codex"` (Section 5.3.7) and is an adapter concern: the orchestration
+core MUST NOT read `codex.*` fields directly. Where the core needs a normalized value, the adapter
+supplies it — notably the stall timeout the core enforces in Section 8.5 is sourced by the Codex
+adapter from `codex.stall_timeout_ms`. A different harness adapter would carry the equivalent value
+in its own namespace.
+
 Fields:
 
 For Codex-owned config values such as `approval_policy`, `thread_sandbox`, and
@@ -453,6 +584,25 @@ fields locally if they want stricter startup checks.
 - `stall_timeout_ms` (integer)
   - Default: `300000` (5 minutes)
   - If `<= 0`, stall detection is disabled.
+  - This is a normalized orchestration value the core consumes (Section 8.5); the Codex adapter
+    sources it from this namespace.
+
+#### 5.3.7 `harness` (object)
+
+Selects the Agent Harness port adapter (Section 3.4) at the edge via dependency injection. This is
+the harness analogue of `tracker.kind`.
+
+Fields:
+
+- `kind` (string)
+  - REQUIRED for dispatch.
+  - Default: `codex`
+  - Current supported value: `codex`
+  - Selects the Agent Harness adapter. The core reads only this key from `harness`; it never names a
+    concrete harness elsewhere.
+  - Harness-specific settings live in the selected adapter's own namespace (for the bundled Codex
+    adapter, the `codex` object in Section 5.3.6).
+  - Unknown/unsupported values fail dispatch preflight validation (Section 6.3).
 
 ### 5.4 Prompt Template Contract
 
@@ -559,16 +709,27 @@ Per-tick dispatch validation:
 Validation checks:
 
 - Workflow file can be loaded and parsed.
-- `tracker.kind` is present and supported.
+- `tracker.kind` is present and supported (selects the Tracker-port adapter).
 - `tracker.api_key` is present after `$` resolution.
 - `tracker.project_slug` is present when REQUIRED by the selected tracker kind.
-- `codex.command` is present and non-empty.
+- `harness.kind` is present and supported (selects the Agent-Harness-port adapter; default `codex`).
+- The selected harness adapter's required launch configuration is present (for `harness.kind ==
+  "codex"`, `codex.command` is present and non-empty).
 
 ### 6.4 Core Config Fields Summary (Cheat Sheet)
 
 This section is intentionally redundant so a coding agent can implement the config layer quickly.
 Extension fields are documented in the extension section that defines them. Core conformance does
 not require recognizing or validating extension fields unless that extension is implemented.
+
+Adapter selection (read by the core; see Section 3.4):
+
+- `tracker.kind`: string, REQUIRED, currently `linear` — selects the Tracker-port adapter
+- `harness.kind`: string, REQUIRED, default `codex`, currently `codex` — selects the Agent-Harness-port adapter
+
+All other `tracker.*` fields belong to the selected tracker adapter's namespace, and all `codex.*`
+fields belong to the Codex harness adapter's namespace (active when `harness.kind=codex`). The core
+does not read those fields directly.
 
 - `tracker.kind`: string, REQUIRED, currently `linear`
 - `tracker.endpoint`: string, default `https://api.linear.app/graphql` when `tracker.kind=linear`
@@ -587,6 +748,8 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
+- `harness.kind`: string, REQUIRED, default `codex`, currently `codex` (selects Agent Harness adapter)
+- `codex.*` below: Codex harness adapter namespace (active when `harness.kind=codex`); not read by the core
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
@@ -673,8 +836,8 @@ Distinct terminal reasons are important because retry logic and logs differ.
   - Update aggregate runtime totals.
   - Schedule exponential-backoff retry.
 
-- `Codex Update Event`
-  - Update live session fields, token counters, and rate limits.
+- `Agent Harness Event` (normalized; Section 10.8)
+  - Update live session fields, token counters, and rate limits from normalized event/usage data.
 
 - `Retry Timer Fired`
   - Re-fetch active candidates and attempt re-dispatch, or release claim if no longer eligible.
@@ -783,7 +946,7 @@ Reconciliation runs every tick and has two parts.
 Part A: Stall detection
 
 - For each running issue, compute `elapsed_ms` since:
-  - `last_codex_timestamp` if any event has been seen, else
+  - `last_event_timestamp` if any normalized event has been seen, else
   - `started_at`
 - If `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
 - If `stall_timeout_ms <= 0`, skip stall detection entirely.
@@ -905,6 +1068,14 @@ Invariant 3: Workspace key is sanitized.
 
 ## 10. Agent Runner Protocol (Coding Agent Integration)
 
+Scope (normative): Sections 10.1–10.7 specify the **Codex Agent Harness adapter** — the bundled
+realization of the Agent Harness port (`harness.kind == "codex"`). The contract the orchestration
+core actually depends on is the normalized **Agent Harness port** in Section 10.8. Everything else in
+this section — the Codex app-server protocol, thread/turn identifiers, the raw event vocabulary in
+Section 10.4, token payload shapes (Section 13.5), and `codex.*` configuration — is adapter-internal
+and MUST NOT leak into the core. A different harness adapter substitutes for Sections 10.1–10.7 while
+satisfying the same Section 10.8 port (see the Adapter Authoring Guide, Section 3.5).
+
 This section defines Symphony's language-neutral responsibilities when integrating a Codex
 app-server. The Codex app-server protocol for the targeted Codex version is the source of truth for
 protocol schemas, message payloads, transport framing, and method names.
@@ -992,14 +1163,19 @@ Transport handling requirements:
 - For stdio-based transports, keep protocol stream handling separate from diagnostic stderr
   handling unless the targeted protocol specifies otherwise.
 
-### 10.4 Emitted Runtime Events (Upstream to Orchestrator)
+### 10.4 Emitted Runtime Events (Codex Adapter Vocabulary)
 
-The app-server client emits structured events to the orchestrator callback. Each event SHOULD
-include:
+This is the Codex adapter's raw event vocabulary. It is adapter-internal: the Codex adapter maps each
+of these onto the normalized Agent Harness port events the core consumes (Section 10.8). The core
+MUST NOT switch on the raw names below; it sees only normalized event types and normalized
+usage/rate-limit data. A `codex_app_server_pid`, when available, is an adapter-internal diagnostic
+and is not part of the normalized event.
+
+Each raw event SHOULD include:
 
 - `event` (enum/string)
 - `timestamp` (UTC timestamp)
-- `codex_app_server_pid` (if available)
+- `codex_app_server_pid` (if available; adapter-internal)
 - OPTIONAL `usage` map (token counts)
 - payload fields as needed
 
@@ -1130,9 +1306,70 @@ Note:
 
 - Workspaces are intentionally preserved after successful runs.
 
+### 10.8 Agent Harness Port Contract (Core-Facing, Normalized)
+
+This subsection is normative and defines the **Agent Harness driven port** (Section 3.4) — the only
+harness contract the orchestration core depends on. Sections 10.1–10.7 are one adapter realization
+(Codex); any conforming harness adapter MUST satisfy this port and MUST NOT require the core to learn
+harness-native protocol details.
+
+Normalized operations:
+
+- `start_session(workspace_path) -> session`
+  - Start an agent session rooted in the per-issue workspace path (Section 9.5 invariants apply).
+  - Returns an opaque `session_id` (Section 4.2) and the session handle.
+- `run_turn(session, prompt, on_event) -> turn_result`
+  - Run one agent turn with the rendered `prompt`.
+  - `on_event` is a callback the adapter invokes with normalized events (below) as they occur.
+  - `turn_result` is one of the normalized outcomes: `succeeded`, `failed`, `cancelled`,
+    `timed_out`, or `input_required`.
+  - The first turn carries the full rendered task prompt; continuation turns carry only continuation
+    guidance on the same live session (Sections 7.1, 10.3) — the adapter preserves session
+    continuity, not the core.
+- `stop_session(session)`
+  - Stop the session and release adapter resources. Called when the worker run ends.
+
+Normalized events delivered to `on_event` (the core consumes only these types):
+
+- `session_started`
+- `turn_completed`
+- `turn_failed`
+- `turn_cancelled`
+- `input_required`
+- `usage_updated` (carries a normalized usage object, below)
+- `rate_limit_updated` (carries a normalized rate-limit snapshot, opaque to the core)
+- `progress` / `notification` (activity signal; any event also refreshes `last_event_timestamp` for
+  stall detection in Section 8.5)
+
+Each normalized event includes at least a normalized `event` type, a UTC `timestamp`, and an OPTIONAL
+summarized `message`. Harness-native identifiers MUST NOT appear on normalized events.
+
+Normalized usage object (the core consumes only this shape; Section 13.5):
+
+- `input_tokens` (integer)
+- `output_tokens` (integer)
+- `total_tokens` (integer)
+
+These represent absolute cumulative session totals. The adapter is responsible for selecting absolute
+totals over deltas from whatever payloads its protocol provides; the core applies the accounting
+rules in Section 13.5 against this normalized shape only.
+
+Normalized timeouts and policies:
+
+- The adapter enforces any harness-internal request/turn timeouts itself (for Codex, Section 10.6).
+- The adapter supplies the normalized stall timeout the core enforces (Section 8.5) from its own
+  configuration namespace.
+- Approval, sandbox, and user-input policy are adapter-defined (Section 10.5); the port only requires
+  that `input_required` is reported as a normalized turn outcome so a run never stalls indefinitely.
+
 ## 11. Issue Tracker Integration Contract (Linear-Compatible)
 
-### 11.1 REQUIRED Operations
+### 11.1 REQUIRED Operations (Tracker Port Contract)
+
+This subsection is normative and defines the **Tracker driven port** (Section 3.4) — the only tracker
+contract the orchestration core depends on. The three operations below, returning the normalized
+issue model (Section 4.1.1) per the normalization rules (Section 11.3), are the complete core-facing
+surface. Section 11.2 (Linear) is one adapter realization.
 
 An implementation MUST support these tracker adapter operations:
 
@@ -1144,6 +1381,13 @@ An implementation MUST support these tracker adapter operations:
 
 3. `fetch_issue_states_by_ids(issue_ids)`
    - Used for active-run reconciliation.
+
+Adapter-swap rule (normative):
+
+- A new tracker (for example Jira or GitHub) MUST be added as a new Tracker-port adapter that
+  satisfies these three reads plus the normalization rules in Section 11.3, selected via
+  `tracker.kind` (Section 5.3.1). It MUST require NO change to the orchestration core, the domain
+  model, or any other adapter (Sections 3.4, 3.5).
 
 ### 11.2 Query Semantics (Linear)
 
@@ -1281,12 +1525,12 @@ SHOULD return:
 - `running` (list of running session rows)
 - each running row SHOULD include `turn_count`
 - `retrying` (list of retry queue rows)
-- `codex_totals`
+- `usage_totals`
   - `input_tokens`
   - `output_tokens`
   - `total_tokens`
   - `seconds_running` (aggregate runtime seconds as of snapshot time, including active sessions)
-- `rate_limits` (latest coding-agent rate limit payload, if available)
+- `rate_limits` (latest normalized rate-limit snapshot, if available)
 
 RECOMMENDED snapshot error modes:
 
@@ -1303,19 +1547,30 @@ correctness.
 
 ### 13.5 Session Metrics and Token Accounting
 
-Token accounting rules:
+Boundary: the orchestration core accounts tokens from the **normalized usage object**
+(`input_tokens` / `output_tokens` / `total_tokens`, absolute cumulative session totals) delivered on
+the `usage_updated` event of the Agent Harness port (Section 10.8). Selecting absolute totals from
+whatever raw payload shapes a harness protocol provides is an **adapter responsibility**, not a core
+one.
 
-- Agent events can include token counts in multiple payload shapes.
+Adapter responsibility (for the bundled Codex adapter):
+
+- Codex events can include token counts in multiple payload shapes.
 - Prefer absolute thread totals when available, such as:
   - `thread/tokenUsage/updated` payloads
   - `total_token_usage` within token-count wrapper events
-- Ignore delta-style payloads such as `last_token_usage` for dashboard/API totals.
+- Ignore delta-style payloads such as `last_token_usage`.
 - Extract input/output/total token counts leniently from common field names within the selected
   payload.
-- For absolute totals, track deltas relative to last reported totals to avoid double-counting.
 - Do not treat generic `usage` maps as cumulative totals unless the event type defines them that
   way.
-- Accumulate aggregate totals in orchestrator state.
+- Emit the result as the normalized usage object on a `usage_updated` event.
+
+Core accounting rules (harness-agnostic):
+
+- Treat the normalized usage object as absolute cumulative session totals.
+- Track deltas relative to last reported totals (`last_reported_*`) to avoid double-counting.
+- Accumulate aggregate totals into `usage_totals` in orchestrator state.
 
 Runtime accounting:
 
@@ -1329,7 +1584,9 @@ Runtime accounting:
 
 Rate-limit tracking:
 
-- Track the latest rate-limit payload seen in any agent update.
+- Track the latest normalized rate-limit snapshot delivered on the `rate_limit_updated` event
+  (Section 10.8) into `rate_limits` in orchestrator state. The snapshot is opaque to the core;
+  mapping a harness-native rate-limit payload onto it is an adapter responsibility.
 - Any human-readable presentation of rate-limit data is implementation-defined.
 
 ### 13.6 Humanized Agent Event Summaries (OPTIONAL)
@@ -1423,7 +1680,7 @@ Minimum endpoints:
           "error": "no available orchestrator slots"
         }
       ],
-      "codex_totals": {
+      "usage_totals": {
         "input_tokens": 5000,
         "output_tokens": 2400,
         "total_tokens": 7400,
@@ -1690,8 +1947,8 @@ function start_service():
     claimed: set(),
     retry_attempts: {},
     completed: set(),
-    codex_totals: {input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
-    codex_rate_limits: null
+    usage_totals: {input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+    rate_limits: null
   }
 
   validation = validate_dispatch_config()
@@ -1783,13 +2040,12 @@ function dispatch_issue(issue, state, attempt):
     identifier: issue.identifier,
     issue,
     session_id: null,
-    codex_app_server_pid: null,
-    last_codex_message: null,
-    last_codex_event: null,
-    last_codex_timestamp: null,
-    codex_input_tokens: 0,
-    codex_output_tokens: 0,
-    codex_total_tokens: 0,
+    last_message: null,
+    last_event: null,
+    last_event_timestamp: null,
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
     last_reported_input_tokens: 0,
     last_reported_output_tokens: 0,
     last_reported_total_tokens: 0,
@@ -1813,7 +2069,7 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
   if run_hook("before_run", workspace.path) failed:
     fail_worker("before_run hook error")
 
-  session = app_server.start_session(workspace=workspace.path)
+  session = harness.start_session(workspace=workspace.path)
   if session failed:
     run_hook_best_effort("after_run", workspace.path)
     fail_worker("agent session startup error")
@@ -1824,25 +2080,24 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
   while true:
     prompt = build_turn_prompt(workflow_template, issue, attempt, turn_number, max_turns)
     if prompt failed:
-      app_server.stop_session(session)
+      harness.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("prompt error")
 
-    turn_result = app_server.run_turn(
+    turn_result = harness.run_turn(
       session=session,
       prompt=prompt,
-      issue=issue,
-      on_message=(msg) -> send(orchestrator_channel, {codex_update, issue.id, msg})
+      on_event=(event) -> send(orchestrator_channel, {agent_event, issue.id, event})
     )
 
     if turn_result failed:
-      app_server.stop_session(session)
+      harness.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("agent turn error")
 
     refreshed_issue = tracker.fetch_issue_states_by_ids([issue.id])
     if refreshed_issue failed:
-      app_server.stop_session(session)
+      harness.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("issue state refresh error")
 
@@ -1856,7 +2111,7 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
 
     turn_number = turn_number + 1
 
-  app_server.stop_session(session)
+  harness.stop_session(session)
   run_hook_best_effort("after_run", workspace.path)
 
   exit_normal()
@@ -1917,6 +2172,11 @@ on_retry_timer(issue_id, state):
 A conforming implementation SHOULD include tests that cover the behaviors defined in this
 specification.
 
+This matrix is the authoritative set of test targets for the test-first development process in
+Section 19: each behavior below SHOULD be expressed as a failing test before the corresponding
+implementation code is written. Behaviors at port and use-case boundaries SHOULD be expressed in the
+Given/When/Then style of Section 20; representative scenarios are collected in Section 17.9.
+
 Validation profiles:
 
 - `Core Conformance`: deterministic tests REQUIRED for all conforming implementations.
@@ -1940,7 +2200,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Invalid YAML front matter returns typed error
 - Front matter non-map returns typed error
 - Config defaults apply when OPTIONAL values are missing
-- `tracker.kind` validation enforces currently supported kind (`linear`)
+- `tracker.kind` validation enforces currently supported kind (`linear`) and selects the Tracker-port adapter
+- `harness.kind` defaults to `codex`, validation enforces a supported kind, and it selects the Agent-Harness-port adapter
 - `tracker.api_key` works (including `$VAR` indirection)
 - `$VAR` resolution works for tracker API key and path values
 - `~` path expansion works
@@ -1975,6 +2236,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Issue state refresh by ID returns minimal normalized issues
 - Issue state refresh query uses GraphQL ID typing (`[ID!]`) as specified in Section 11.2
 - Error mapping for request errors, non-200, GraphQL errors, malformed payloads
+- The three Tracker-port reads (Section 11.1) return the normalized issue model regardless of adapter
+- An in-memory/fake Tracker adapter satisfying the three reads + Section 11.3 normalization drives the core unchanged (no core code references a concrete tracker)
 
 ### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
 
@@ -1991,6 +2254,17 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Retry queue entries include attempt, due time, identifier, and error
 - Stall detection kills stalled sessions and schedules retry
 - Slot exhaustion requeues retries with explicit error reason
+- Live session state and orchestrator state carry only harness-agnostic fields (opaque `session_id`,
+  generic `input_tokens`/`output_tokens`/`total_tokens`, `last_event`/`last_event_timestamp`); no
+  harness-native identifier or token field name (for example `thread_id`, `turn_id`,
+  `codex_app_server_pid`, `codex_*`) appears in core state, events, or logs
+- The core updates session/token/rate-limit state only from normalized Agent Harness port events
+  (Section 10.8), never from raw harness protocol payloads
+- Adapter-swap (tracker): substituting a different Tracker-port adapter (selected via `tracker.kind`)
+  exercises dispatch, reconciliation, and retry with no change to orchestration-core code
+- Adapter-swap (harness): substituting a different Agent-Harness-port adapter (selected via
+  `harness.kind`) exercises dispatch, reconciliation, and retry with no change to orchestration-core
+  code
 - If a snapshot API is implemented, it returns running rows, retry rows, token totals, and rate
   limits
 - If a snapshot API is implemented, timeout/unavailable cases are surfaced
@@ -2015,6 +2289,12 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Usage and rate-limit telemetry exposed by the targeted protocol is extracted
 - Approval, user-input-required, usage, and rate-limit signals are interpreted according to the
   targeted protocol
+- The Codex adapter maps its raw event vocabulary (Section 10.4) onto the normalized Agent Harness
+  port events (Section 10.8), and its raw token payload shapes (Section 13.5) onto the normalized
+  usage object — the core sees only the normalized shapes
+- The Agent Harness port surface (`start_session` → `run_turn(prompt, on_event)` → `stop_session`)
+  is exercisable by an in-memory/fake harness adapter that emits scripted normalized events, with no
+  real coding-agent process
 - If client-side tools are implemented, session startup advertises the supported tool specs
   using the targeted app-server protocol
 - If the `linear_graphql` client-side tool extension is implemented:
@@ -2057,6 +2337,68 @@ network access, or external service permissions are unavailable.
 - If a real-integration profile is explicitly enabled in CI or release validation, failures SHOULD
   fail that job.
 
+### 17.9 Ports, Adapters, and Testing Support (`Core Conformance`)
+
+These behaviors are `Core Conformance` despite following the Real Integration Profile in document
+order. They verify the hexagonal boundary (Sections 3.4, 3.5) and the testing-support requirements
+(Sections 20, 21).
+
+- The orchestration core depends only on the Tracker port (Section 11.1) and the Agent Harness port
+  (Section 10.8); no core module references a concrete adapter, adapter protocol, adapter-specific
+  identifier, or adapter config namespace
+- Adding a Tracker adapter requires only a new adapter satisfying the three reads + Section 11.3
+  normalization, selected via `tracker.kind`, with no orchestration-core change
+- Adding an Agent Harness adapter requires only a new adapter satisfying the normalized
+  session/turn/event/usage contract (Section 10.8), selected via `harness.kind`, with no
+  orchestration-core change
+- Both ports are small and behavior-focused enough that the entire core test suite runs against
+  in-memory fake adapters, with no real tracker (Linear) or harness (Codex) dependency
+- Builders exist for domain/config/state test data: `Issue` (Section 4.1.1), Workflow Definition /
+  Service Config (Sections 4.1.3, 5.3), and run/session/retry state (Sections 4.1.5–4.1.8)
+- Builder-style fake/mock adapters exist for both the Tracker port and the Agent Harness port, and
+  can be configured to script reads, events, failures, and timeouts
+- A failing test precedes the implementation it covers for each behavior in this matrix (Section 19,
+  evidenced by version-control history or an equivalent record)
+
+### 17.10 Behavioral Scenarios (Given/When/Then) (`Core Conformance`)
+
+Representative port/use-case behaviors expressed in the Section 20 style. The phrasing is the
+normative contract; the test framework is implementation-defined.
+
+Dispatch (Sections 8.1–8.3, 16.2):
+
+- Given an in-memory Tracker adapter returning two active candidates and a global concurrency limit
+  of 1, When a poll tick runs, Then exactly one issue is dispatched and the other remains unclaimed.
+- Given a `Todo` issue with a non-terminal blocker, When candidate selection runs, Then the issue is
+  not dispatch-eligible; And When the blocker becomes terminal, Then the issue becomes eligible.
+
+Reconciliation (Sections 8.5, 16.3):
+
+- Given a running issue whose tracker state has become terminal, When reconciliation runs, Then the
+  worker is terminated and its workspace is cleaned.
+- Given a running issue whose tracker state has become neither active nor terminal, When
+  reconciliation runs, Then the worker is terminated without workspace cleanup.
+- Given a running issue with no normalized event for longer than the stall timeout, When
+  reconciliation runs, Then the worker is terminated and a retry is scheduled.
+
+Retry (Sections 8.4, 16.6):
+
+- Given a worker that exits normally, When it exits, Then a short continuation retry (attempt 1) is
+  scheduled.
+- Given a worker that exits abnormally on attempt N, When it exits, Then a retry is scheduled with
+  delay `min(10000 * 2^(N-1), agent.max_retry_backoff_ms)`.
+- Given a due retry but no available orchestrator slots, When the retry timer fires, Then the entry
+  is requeued with error `no available orchestrator slots`.
+
+Adapter swap (Sections 3.4, 3.5):
+
+- Given the orchestration core wired to an in-memory Tracker adapter and an in-memory Agent Harness
+  adapter, When each fake is replaced by a different fake implementing the same port, Then all
+  dispatch/reconcile/retry behaviors above still hold with no change to orchestration-core code.
+- Given an Agent Harness adapter that emits the normalized event sequence `session_started`,
+  `usage_updated`, `turn_completed`, When a turn runs, Then the core records the opaque `session_id`,
+  accumulates `usage_totals`, and sets `last_event` without observing any harness-native field.
+
 ## 18. Implementation Checklist (Definition of Done)
 
 Use the same validation profiles as Section 17:
@@ -2085,6 +2427,25 @@ Use the same validation profiles as Section 17:
 - Workspace cleanup for terminal issues (startup sweep + active transition)
 - Structured logs with `issue_id`, `issue_identifier`, and `session_id`
 - Operator-visible observability (structured logs; OPTIONAL snapshot/status surface)
+- Hexagonal boundary: orchestration core depends only on the Tracker port (Section 11.1) and the
+  Agent Harness port (Section 10.8); no core code names or imports a concrete adapter
+- `tracker.kind` and `harness.kind` (default `codex`) select adapters at the edge via dependency
+  injection; the core performs no adapter selection
+- Tracker-adapter pluggability: a new tracker is a new adapter only (three reads + Section 11.3),
+  with no orchestration-core change (Sections 3.4, 3.5)
+- Harness-adapter pluggability: a new harness is a new adapter only (normalized Section 10.8
+  session/turn/event/usage contract), with no orchestration-core change (Sections 3.4, 3.5)
+- Harness-agnostic core state: Live Session and orchestrator state hold only generic
+  `session_id`/token/`last_event` fields; harness-native ids/payloads live in the adapter
+- Normalized consumption: core updates session/token/rate-limit state only from normalized Agent
+  Harness port events and the normalized usage object
+- Test-first development (Section 19): a failing test precedes each implemented behavior in
+  Section 17
+- Port/use-case behaviors expressed in Given/When/Then style (Section 20), including the scenarios in
+  Section 17.10
+- Testing support (Section 21): builders for issue/config/run/session/retry test data, plus
+  builder-style fake adapters for both ports, enabling the full core test suite to run without real
+  Linear or Codex
 
 ### 18.2 RECOMMENDED Extensions (Not REQUIRED for Conformance)
 
@@ -2097,7 +2458,13 @@ Use the same validation profiles as Section 17:
   implementation details.
 - TODO: Add first-class tracker write APIs (comments/state transitions) in the orchestrator instead
   of only via agent tools.
-- TODO: Add pluggable issue tracker adapters beyond Linear.
+- Ship additional Tracker adapters beyond Linear (for example Jira, GitHub). The Tracker port and its
+  pluggability are REQUIRED core conformance from iteration 1 (Sections 3.4, 3.5, 11.1); this item
+  covers shipping concrete additional adapters, not building the port. (Revised: the original TODO
+  framed pluggability itself as future work, which now contradicts the hexagonal rule in Section 3.4.)
+- Ship additional Agent Harness adapters beyond Codex. As above, the Agent Harness port and its
+  pluggability are REQUIRED core conformance from iteration 1 (Sections 3.4, 3.5, 10.8); this item
+  covers shipping concrete additional adapters only.
 
 ### 18.3 Operational Validation Before Production (RECOMMENDED)
 
@@ -2105,6 +2472,54 @@ Use the same validation profiles as Section 17:
 - Verify hook execution and workflow path resolution on the target host OS/shell environment.
 - If the OPTIONAL HTTP server is shipped, verify the configured port behavior and loopback/default
   bind expectations on the target environment.
+
+## 19. Development Process: Test-Driven Development (Normative)
+
+Conforming implementations MUST be developed test-first.
+
+- For each behavior in Section 17, a test MUST be written and MUST be observed to fail before the
+  implementation code that satisfies it is written (red).
+- The minimum implementation needed to make the failing test pass is then written (green).
+- The code is then refactored without changing behavior, keeping the test suite green (refactor).
+- Section 17 is the authoritative set of test targets. New behavior added to an implementation
+  SHOULD extend Section 17 (or its local equivalent) with a test target before implementation.
+- This process is what makes the hexagonal boundary enforceable in practice: because the core is
+  tested against in-memory fake adapters (Section 21) before any real adapter exists, accidental
+  coupling to Linear or Codex fails the suite early.
+
+## 20. Behavioral Specifications (BDD Style) (Normative)
+
+Behaviors at the port and use-case boundaries MUST be expressible as Given/When/Then specifications.
+
+- `Given` establishes the starting state (for example fake adapter responses, config, orchestrator
+  state); `When` applies one trigger (Section 7.3); `Then` asserts the observable outcome.
+- The Given/When/Then phrasing is the normative description of the contract. This specification does
+  NOT mandate any particular tool or syntax (for example Cucumber or Gherkin); equivalent expression
+  in any test framework is conforming.
+- Scenarios SHOULD be written at the seams that matter most for portability: dispatch, reconciliation,
+  and retry (Sections 8, 16), and the adapter-swap guarantee (Section 3.4).
+- Section 17.10 collects representative scenarios; conforming suites SHOULD cover at least those.
+
+## 21. Testing Support: Builders and Test Doubles (Normative)
+
+Testability is a design constraint on the ports, not an afterthought.
+
+- The two driven ports (Sections 10.8, 11.1) MUST be small and behavior-focused enough that the
+  entire orchestration-core test suite can run against in-memory fake adapters, with no real Linear
+  or Codex dependency.
+- Test data MUST be constructible through builders that default every field and allow overriding only
+  what a test cares about, for at least:
+  - `Issue` (Section 4.1.1)
+  - Workflow Definition and Service Config (Sections 4.1.3, 5.3)
+  - run/session/retry state (Sections 4.1.5, 4.1.6, 4.1.7, 4.1.8)
+- Test doubles for both ports MUST be provided as builder-style fakes/mocks:
+  - a fake Tracker adapter whose three reads (Section 11.1) can be scripted with candidate sets,
+    state refreshes, terminal sets, and induced failures;
+  - a fake Agent Harness adapter whose `start_session`/`run_turn`/`stop_session` (Section 10.8) can be
+    scripted with normalized event sequences, usage/rate-limit updates, and induced
+    failures/timeouts.
+- These builders and fakes are the mechanism by which Sections 19 and 20 are satisfied without
+  external services.
 
 ## Appendix A. SSH Worker Extension (OPTIONAL)
 
